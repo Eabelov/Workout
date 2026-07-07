@@ -4,7 +4,10 @@
 
 .DESCRIPTION
     Ищет объекты в Active Directory по атрибуту extensionAttribute13 и формирует CSV
-    с полями: Name, SamAccountName, mail, EmailAddress, enabled.
+    с полями: Name, SamAccountName, mail, PrimarySmtpAddress, enabled.
+
+    PrimarySmtpAddress берётся из Exchange (Get-Mailbox).
+    Запускайте скрипт из Exchange Management Shell (EMS) — отдельное подключение не требуется.
 
 .PARAMETER ExtensionAttribute13Value
     Значение extensionAttribute13 для фильтрации. По умолчанию: 11.
@@ -26,8 +29,7 @@
     .\Export-UsersByExtensionAttribute13.ps1 -ExtensionAttribute13Value 11 -OutputPath C:\temp\users.csv
 
 .NOTES
-    Требуется модуль ActiveDirectory (RSAT).
-    EmailAddress — основной SMTP-адрес из proxyAddresses (префикс SMTP:).
+    Требуется модуль ActiveDirectory (RSAT) и Exchange Management Shell.
 #>
 [CmdletBinding()]
 param(
@@ -47,33 +49,12 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-function Get-PrimarySmtpAddress {
-    param(
-        [AllowNull()]
-        [string[]]$ProxyAddresses,
-
-        [AllowNull()]
-        [string]$Mail,
-
-        [AllowNull()]
-        [string]$UserPrincipalName
-    )
-
-    foreach ($address in ($ProxyAddresses | Where-Object { $_ })) {
-        if ($address -clike 'SMTP:*') {
-            return $address.Substring(5)
-        }
-    }
-
-    if ($Mail) {
-        return $Mail
-    }
-
-    return $UserPrincipalName
-}
-
 if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
     throw 'Модуль ActiveDirectory не найден. Установите RSAT: Active Directory Domain Services Tools.'
+}
+
+if (-not (Get-Command Get-Mailbox -ErrorAction SilentlyContinue)) {
+    throw 'Команда Get-Mailbox недоступна. Запустите скрипт из Exchange Management Shell.'
 }
 
 Import-Module ActiveDirectory
@@ -90,8 +71,6 @@ $adParams = @{
         'Name',
         'SamAccountName',
         'Mail',
-        'proxyAddresses',
-        'UserPrincipalName',
         'Enabled'
     )
 }
@@ -111,13 +90,21 @@ if ($users.Count -eq 0) {
 
 Write-Host "Найдено объектов: $($users.Count)" -ForegroundColor Green
 
+Write-Host "Получение PrimarySmtpAddress из Exchange..." -ForegroundColor Cyan
+
+$primarySmtpBySamAccount = @{}
+Get-Mailbox -Filter "CustomAttribute13 -eq '$ExtensionAttribute13Value'" -ResultSize Unlimited |
+    ForEach-Object {
+        $primarySmtpBySamAccount[$_.SamAccountName] = $_.PrimarySmtpAddress
+    }
+
 $exportRows = foreach ($user in ($users | Sort-Object Name)) {
     [PSCustomObject]@{
-        Name           = $user.Name
-        SamAccountName = $user.SamAccountName
-        mail           = $user.Mail
-        EmailAddress   = Get-PrimarySmtpAddress -ProxyAddresses $user.proxyAddresses -Mail $user.Mail -UserPrincipalName $user.UserPrincipalName
-        enabled        = $user.Enabled
+        Name               = $user.Name
+        SamAccountName     = $user.SamAccountName
+        mail               = $user.Mail
+        PrimarySmtpAddress = $primarySmtpBySamAccount[$user.SamAccountName]
+        enabled            = $user.Enabled
     }
 }
 
