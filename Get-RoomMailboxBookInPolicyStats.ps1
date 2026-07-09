@@ -3,32 +3,47 @@
     Возвращает общее количество room mailbox и количество с заполненным BookInPolicy.
 
 .DESCRIPTION
-    Скрипт подключается к Exchange Online (если сессия ещё не установлена),
-    получает все room mailbox и считает, у скольких из них свойство BookInPolicy
+    Скрипт для on-premises Exchange Server.
+    Получает все room mailbox и считает, у скольких из них свойство BookInPolicy
     содержит хотя бы одного пользователя.
 
-.PARAMETER UserPrincipalName
-    UPN администратора для подключения к Exchange Online.
-    Если не указан, используется Connect-ExchangeOnline без параметров
-    (интерактивная или существующая аутентификация).
+    Запускайте из Exchange Management Shell или укажите -ExchangeServer
+    для подключения через удалённую PowerShell-сессию.
+
+.PARAMETER ExchangeServer
+    FQDN сервера Exchange (например, exchange01.contoso.local).
+    Не нужен, если скрипт уже запущен в Exchange Management Shell.
+
+.PARAMETER Credential
+    Учётные данные для удалённого подключения. Если не указаны, используется
+    текущий контекст Windows (Kerberos).
+
+.PARAMETER UseSsl
+    Подключаться по HTTPS вместо HTTP.
 
 .PARAMETER AlreadyConnected
-    Пропустить подключение, если сессия Exchange Online уже активна.
-
-.EXAMPLE
-    .\Get-RoomMailboxBookInPolicyStats.ps1
-
-.EXAMPLE
-    .\Get-RoomMailboxBookInPolicyStats.ps1 -UserPrincipalName admin@contoso.com
+    Пропустить подключение, если сессия Exchange Management Shell уже активна.
 
 .EXAMPLE
     .\Get-RoomMailboxBookInPolicyStats.ps1 -AlreadyConnected
+
+.EXAMPLE
+    .\Get-RoomMailboxBookInPolicyStats.ps1 -ExchangeServer exchange01.contoso.local
+
+.EXAMPLE
+    .\Get-RoomMailboxBookInPolicyStats.ps1 -ExchangeServer exchange01.contoso.local -UseSsl
 #>
 
 [CmdletBinding()]
 param(
     [Parameter()]
-    [string] $UserPrincipalName,
+    [string] $ExchangeServer,
+
+    [Parameter()]
+    [System.Management.Automation.PSCredential] $Credential,
+
+    [Parameter()]
+    [switch] $UseSsl,
 
     [Parameter()]
     [switch] $AlreadyConnected
@@ -37,9 +52,10 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-function Test-ExchangeOnlineSession {
+function Test-ExchangeSession {
     try {
-        Get-OrganizationConfig -ErrorAction Stop | Out-Null
+        Get-Command Get-Mailbox -ErrorAction Stop | Out-Null
+        Get-ExchangeServer -ErrorAction Stop | Out-Null
         return $true
     }
     catch {
@@ -47,24 +63,40 @@ function Test-ExchangeOnlineSession {
     }
 }
 
-function Connect-ExchangeOnlineIfNeeded {
-    if ($AlreadyConnected -or (Test-ExchangeOnlineSession)) {
-        Write-Verbose 'Сессия Exchange Online уже активна.'
+function Connect-ExchangeOnPremIfNeeded {
+    if ($AlreadyConnected -or (Test-ExchangeSession)) {
+        Write-Verbose 'Сессия Exchange Management Shell уже активна.'
         return
     }
 
-    if (-not (Get-Module -ListAvailable -Name ExchangeOnlineManagement)) {
-        throw 'Модуль ExchangeOnlineManagement не установлен. Установите: Install-Module ExchangeOnlineManagement'
+    if (-not $ExchangeServer) {
+        throw @'
+Сессия Exchange Management Shell не обнаружена.
+Запустите скрипт из EMS или укажите параметр -ExchangeServer.
+Пример: .\Get-RoomMailboxBookInPolicyStats.ps1 -ExchangeServer exchange01.contoso.local
+'@
     }
 
-    Import-Module ExchangeOnlineManagement -ErrorAction Stop
+    $scheme = if ($UseSsl) { 'https' } else { 'http' }
+    $connectionUri = '{0}://{1}/PowerShell/' -f $scheme, $ExchangeServer
 
-    if ($UserPrincipalName) {
-        Connect-ExchangeOnline -UserPrincipalName $UserPrincipalName -ShowBanner:$false
+    $sessionParams = @{
+        ConfigurationName = 'Microsoft.Exchange'
+        ConnectionUri     = $connectionUri
+        ErrorAction       = 'Stop'
+    }
+
+    if ($Credential) {
+        $sessionParams.Credential = $Credential
+        $sessionParams.Authentication = 'Negotiate'
     }
     else {
-        Connect-ExchangeOnline -ShowBanner:$false
+        $sessionParams.Authentication = 'Kerberos'
     }
+
+    Write-Host "Подключение к $connectionUri ..." -ForegroundColor Cyan
+    $session = New-PSSession @sessionParams
+    Import-PSSession $session -DisableNameChecking -AllowClobber | Out-Null
 }
 
 function Test-BookInPolicyPopulated {
@@ -85,11 +117,12 @@ function Test-BookInPolicyPopulated {
     return -not [string]::IsNullOrWhiteSpace($value)
 }
 
-Connect-ExchangeOnlineIfNeeded
+Connect-ExchangeOnPremIfNeeded
 
 Write-Host 'Получение room mailbox...' -ForegroundColor Cyan
 
-$roomMailboxes = Get-EXOMailbox -RecipientTypeDetails RoomMailbox -Properties BookInPolicy -ResultSize Unlimited
+$roomMailboxes = Get-Mailbox -RecipientTypeDetails RoomMailbox -ResultSize Unlimited |
+    Select-Object DisplayName, PrimarySmtpAddress, BookInPolicy
 
 $totalCount = @($roomMailboxes).Count
 $withBookInPolicyCount = @(
@@ -98,16 +131,16 @@ $withBookInPolicyCount = @(
 $withoutBookInPolicyCount = $totalCount - $withBookInPolicyCount
 
 $result = [PSCustomObject]@{
-    TotalRoomMailboxes           = $totalCount
-    WithBookInPolicy             = $withBookInPolicyCount
-    WithoutBookInPolicy          = $withoutBookInPolicyCount
-    PercentWithBookInPolicy      = if ($totalCount -gt 0) {
+    TotalRoomMailboxes      = $totalCount
+    WithBookInPolicy        = $withBookInPolicyCount
+    WithoutBookInPolicy     = $withoutBookInPolicyCount
+    PercentWithBookInPolicy = if ($totalCount -gt 0) {
         [math]::Round(($withBookInPolicyCount / $totalCount) * 100, 2)
     }
     else {
         0
     }
-    CollectedAt                  = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+    CollectedAt             = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
 }
 
 Write-Host ''
