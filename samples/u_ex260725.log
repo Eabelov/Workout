@@ -1,0 +1,8 @@
+#Software: Microsoft Internet Information Services 10.0
+#Version: 1.0
+#Date: 2026-07-25 00:00:00
+#Fields: date time s-ip cs-method cs-uri-stem cs-uri-query s-port cs-username c-ip cs(User-Agent) cs(Referer) sc-status sc-substatus sc-win32-status time-taken
+2026-07-25 08:15:01 10.0.0.10 POST /EWS/Exchange.asmx - 443 DOMAIN\user1 192.168.1.50 Microsoft+Office/16.0 - 200 0 0 312
+2026-07-25 08:15:05 10.0.0.10 GET /owa/ - 443 - 192.168.1.51 Mozilla/5.0 - 401 1 2148074254 45
+2026-07-25 08:15:06 10.0.0.10 GET /owa/ - 443 DOMAIN\user2 192.168.1.51 Mozilla/5.0 - 200 0 0 128
+2026-07-25 08:16:10 10.0.0.10 POST /Microsoft-Server-ActiveSync - 443 DOMAIN\user3 192.168.1.60 Apple-iPhone - 503 0 64 5001
