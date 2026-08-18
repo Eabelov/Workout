@@ -195,7 +195,7 @@ else {
 [System.IO.File]::WriteAllLines($OutputPath, $csvLines, $utf8Bom)
 
 Write-Host ''
-Write-Host "Просмотрено событий $EventId: $($counters.Raw)"
+Write-Host "Просмотрено событий ${EventId}: $($counters.Raw)"
 Write-Host "Найдено писем (тема содержит '$SubjectContains'): $($results.Count)"
 Write-Host "CSV сохранён: $OutputPath"
 
