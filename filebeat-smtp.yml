@@ -1,0 +1,174 @@
+# Filebeat config for Exchange SMTP protocol logs (FrontEnd + Hub, Send + Receive).
+# Log format: CSV with comma delimiter.
+# Fields: date-time,connector-id,session-id,sequence-number,local-endpoint,remote-endpoint,event,data,context
+# Header lines start with # and are skipped.
+# File names: SENDyyyyMMddhh-nnnn.log / RECVyyyyMMddhh-nnnn.log
+
+filebeat.inputs:
+  - type: filestream
+    id: smtp-frontend-send
+    paths:
+      - C:\Queue\TransportLogs\FrontEnd\ProtocolLog\SmtpSend\*.log
+    encoding: utf-8
+    exclude_lines: ['^#']
+    fields:
+      transport_role: frontend
+      smtp_direction: send
+      log_type: smtp_protocol
+    fields_under_root: true
+
+  - type: filestream
+    id: smtp-frontend-receive
+    paths:
+      - C:\Queue\TransportLogs\FrontEnd\ProtocolLog\SmtpReceive\*.log
+    encoding: utf-8
+    exclude_lines: ['^#']
+    fields:
+      transport_role: frontend
+      smtp_direction: receive
+      log_type: smtp_protocol
+    fields_under_root: true
+
+  - type: filestream
+    id: smtp-hub-send
+    paths:
+      - C:\Queue\TransportLogs\Hub\ProtocolLog\SmtpSend\*.log
+    encoding: utf-8
+    exclude_lines: ['^#']
+    fields:
+      transport_role: hub
+      smtp_direction: send
+      log_type: smtp_protocol
+    fields_under_root: true
+
+  - type: filestream
+    id: smtp-hub-receive
+    paths:
+      - C:\Queue\TransportLogs\Hub\ProtocolLog\SmtpReceive\*.log
+    encoding: utf-8
+    exclude_lines: ['^#']
+    fields:
+      transport_role: hub
+      smtp_direction: receive
+      log_type: smtp_protocol
+    fields_under_root: true
+
+processors:
+  - decode_csv_fields:
+      fields:
+        message: csv_array
+      separator: ","
+      trim_leading_space: false
+      overwrite_keys: true
+      fail_on_error: false
+      when:
+        equals:
+          log_type: smtp_protocol
+  - extract_array:
+      field: csv_array
+      mappings:
+        smtp.protocol.date-time: 0
+        smtp.protocol.connector-id: 1
+        smtp.protocol.session-id: 2
+        smtp.protocol.sequence-number: 3
+        smtp.protocol.local-endpoint: 4
+        smtp.protocol.remote-endpoint: 5
+        smtp.protocol.event: 6
+        smtp.protocol.data: 7
+        smtp.protocol.context: 8
+      fail_on_error: false
+      omit_empty: false
+      when:
+        has_fields: ["csv_array"]
+  # data often contains commas (SMTP banners, queued-mail text).
+  # If CSV split produced extra columns: first 7 stay as-is, last is context, the rest is data.
+  - script:
+      lang: javascript
+      source: |
+        function process(event) {
+          var arr = event.Get("csv_array");
+          if (arr && arr.length > 9) {
+            event.Put("smtp.protocol.data", arr.slice(7, arr.length - 1).join(","));
+            event.Put("smtp.protocol.context", arr[arr.length - 1]);
+          }
+
+          var ev = event.Get("smtp.protocol.event");
+          var names = {
+            "+": "Connect",
+            "-": "Disconnect",
+            ">": "Send",
+            "<": "Receive",
+            "*": "Information"
+          };
+          if (ev && names[ev]) {
+            event.Put("smtp.protocol.event_name", names[ev]);
+          }
+
+          var ts = event.Get("smtp.protocol.date-time");
+          if (ts) {
+            event.Put("smtp.protocol.timestamp", ts);
+          }
+
+          splitEndpoint(event, "smtp.protocol.local-endpoint", "smtp.protocol.local-ip", "smtp.protocol.local-port");
+          splitEndpoint(event, "smtp.protocol.remote-endpoint", "smtp.protocol.remote-ip", "smtp.protocol.remote-port");
+        }
+
+        function splitEndpoint(event, src, ipField, portField) {
+          var ep = event.Get(src);
+          if (!ep) {
+            return;
+          }
+          var idx = ep.lastIndexOf(":");
+          if (idx <= 0) {
+            return;
+          }
+          var ip = ep.substring(0, idx);
+          var port = ep.substring(idx + 1);
+          if (ip.charAt(0) === "[" && ip.charAt(ip.length - 1) === "]") {
+            ip = ip.substring(1, ip.length - 1);
+          }
+          event.Put(ipField, ip);
+          event.Put(portField, port);
+        }
+      ignore_failure: true
+      when:
+        has_fields: ["smtp.protocol.event"]
+  - convert:
+      fields:
+        - {from: "smtp.protocol.sequence-number", to: "smtp.protocol.sequence-number", type: long}
+        - {from: "smtp.protocol.local-port", to: "smtp.protocol.local-port", type: long}
+        - {from: "smtp.protocol.remote-port", to: "smtp.protocol.remote-port", type: long}
+      ignore_missing: true
+      fail_on_error: false
+  - drop_fields:
+      fields: ["csv_array"]
+      ignore_missing: true
+      when:
+        has_fields: ["csv_array"]
+  - drop_fields:
+      fields: ["ecs", "host", "input", "message", "log_type", "log.offset", "log.file.idxhi", "log.file.idxlo", "log.file.vol", "log.file.fingerprint"]
+      ignore_missing: true
+
+filebeat.registry.path: C:\Program Files\filebeat-smtp\smtp\registry
+filebeat.registry.flush: 30s
+
+output.kafka:
+  hosts: ["test.contoso.ru"]
+  topic: "KE_contoso"
+  ssl.enabled: true
+  ssl.certificate_authorities: ['C:\Program Files\filebeat-smtp\RootCA_new.crt']
+  sasl.enabled: true
+  sasl.mechanism: SCRAM-SHA-512
+  username: "Login"
+  password: "Password"
+  compression: zstd
+  max_message_bytes: 10000000
+  required_acks: 1
+
+logging.level: info
+logging.to_files: true
+logging.files:
+  path: C:\Program Files\filebeat-smtp\smtp
+  name: filebeat.log
+  keepfiles: 7
+  permissions: 0644
