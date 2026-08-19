@@ -12,6 +12,12 @@
     Этот скрипт копирует дерево через robocopy и сверяет число файлов с источником.
     Локальный сервер (откуда запускаете) пропускается — файлы там уже есть.
 
+    Если служба уже запущена, filebeat.exe держит файлы: robocopy тогда
+    пропускает занятые бинарники или падает. Перед копированием служба
+    останавливается, после копирования запускается снова, если она была
+    Running. Повторно install-service-*.ps1 не вызывается — New-Service
+    упрётся в «служба уже существует».
+
 .PARAMETER Source
     Локальный каталог Filebeat. По умолчанию C:\Program Files\filebeat-smtp.
 
@@ -22,20 +28,29 @@
     URI удалённого PowerShell Exchange, если скрипт запущен не из EMS.
 
 .PARAMETER InstallService
-    После успешного копирования запустить install-service-*.ps1 и Start-Service.
+    Если службы ещё нет — выполнить install-service-*.ps1 и запустить её.
+    Если служба уже есть, установщик не трогается.
+
+.PARAMETER NoServiceRestart
+    Не останавливать и не запускать службу. Имеет смысл только если она
+    точно не запущена: иначе filebeat.exe останется залочен.
 
 .PARAMETER ServiceName
     Имя службы Windows. По умолчанию совпадает с именем каталога источника.
 
 .PARAMETER Credential
-    Учётные данные для Invoke-Command (установка службы). Для C$ обычно
-    достаточно текущего токена администратора.
+    Учётные данные для Invoke-Command. Для C$ и Get-Service -ComputerName
+    обычно достаточно текущего токена администратора.
 
 .EXAMPLE
     .\Copy-FilebeatToExchange.ps1
 
 .EXAMPLE
     .\Copy-FilebeatToExchange.ps1 -InstallService
+
+.EXAMPLE
+    # Служба уже запущена: скрипт остановит её, скопирует файлы и запустит снова.
+    .\Copy-FilebeatToExchange.ps1
 
 .EXAMPLE
     .\Copy-FilebeatToExchange.ps1 -Source 'C:\Program Files\filebeat-iis' -InstallService
@@ -53,6 +68,9 @@ param(
 
     [Parameter()]
     [switch]$InstallService,
+
+    [Parameter()]
+    [switch]$NoServiceRestart,
 
     [Parameter()]
     [string]$ServiceName,
@@ -162,6 +180,112 @@ function Get-FileCount {
     }
 
     return @(Get-ChildItem -LiteralPath $Path -Recurse -Force -File -ErrorAction SilentlyContinue).Count
+}
+
+function Test-ServiceNotFound {
+    param($ErrorRecord)
+
+    $msg = [string]$ErrorRecord.Exception.Message
+    return (
+        $msg -match 'Cannot find any service' -or
+        $msg -match 'No service with' -or
+        $msg -match 'не найден' -or
+        $ErrorRecord.CategoryInfo.Category -eq 'ObjectNotFound'
+    )
+}
+
+function Invoke-RemoteServiceAction {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ComputerName,
+
+        [Parameter(Mandatory)]
+        [string]$Name,
+
+        [Parameter(Mandatory)]
+        [ValidateSet('Get', 'Stop', 'Start')]
+        [string]$Action,
+
+        [System.Management.Automation.PSCredential]$Cred
+    )
+
+    $block = {
+        param([string]$SvcName, [string]$Act)
+
+        $ErrorActionPreference = 'Stop'
+        $svc = Get-Service -Name $SvcName -ErrorAction SilentlyContinue
+        if ($Act -eq 'Get') {
+            if (-not $svc) { return 'Absent' }
+            return $svc.Status.ToString()
+        }
+
+        if (-not $svc) {
+            if ($Act -eq 'Stop') { return 'Absent' }
+            throw "Служба $SvcName не найдена"
+        }
+
+        if ($Act -eq 'Stop') {
+            if ($svc.Status -ne 'Stopped') {
+                Stop-Service -Name $SvcName -Force
+                $svc.WaitForStatus('Stopped', '00:00:45')
+            }
+            return 'Stopped'
+        }
+
+        if ($svc.Status -ne 'Running') {
+            Start-Service -Name $SvcName
+            $svc.WaitForStatus('Running', '00:00:45')
+        }
+        return 'Running'
+    }
+
+    # RPC, те же права что и C$ — WinRM не нужен.
+    try {
+        $svc = Get-Service -ComputerName $ComputerName -Name $Name -ErrorAction Stop
+
+        if ($Action -eq 'Get') {
+            return $svc.Status.ToString()
+        }
+
+        if ($Action -eq 'Stop') {
+            if ($svc.Status -ne 'Stopped') {
+                Stop-Service -InputObject $svc -Force -ErrorAction Stop
+                $svc.WaitForStatus(
+                    [System.ServiceProcess.ServiceControllerStatus]::Stopped,
+                    [timespan]::FromSeconds(45)
+                )
+            }
+            return 'Stopped'
+        }
+
+        if ($svc.Status -ne 'Running') {
+            Start-Service -InputObject $svc -ErrorAction Stop
+            $svc.WaitForStatus(
+                [System.ServiceProcess.ServiceControllerStatus]::Running,
+                [timespan]::FromSeconds(45)
+            )
+        }
+        return 'Running'
+    }
+    catch {
+        if ($Action -eq 'Get' -and (Test-ServiceNotFound $_)) {
+            return 'Absent'
+        }
+        if ($Action -eq 'Stop' -and (Test-ServiceNotFound $_)) {
+            return 'Absent'
+        }
+
+        $icm = @{
+            ComputerName = $ComputerName
+            ScriptBlock  = $block
+            ArgumentList = @($Name, $Action)
+            ErrorAction  = 'Stop'
+        }
+        if ($Cred) {
+            $icm.Credential = $Cred
+        }
+        return Invoke-Command @icm
+    }
 }
 
 function Copy-DirectoryWithRobocopy {
@@ -329,15 +453,38 @@ try {
             Message = ''
         }
 
+        $stoppedByScript = $false
+        $remote = $null
+
         try {
             $remote = Resolve-RemoteComputer -Name $server.Name -Fqdn $server.Fqdn
             $dest = Join-Path $remote.ShareRoot $packageName
 
-            if (-not $PSCmdlet.ShouldProcess($dest, "Копировать $packageName ($sourceFiles файлов)")) {
+            $copyTarget = $dest
+            if (-not $NoServiceRestart) {
+                $copyTarget = "$dest (с остановкой $ServiceName при необходимости)"
+            }
+
+            if (-not $PSCmdlet.ShouldProcess($copyTarget, "Копировать $packageName ($sourceFiles файлов)")) {
                 $row.Status = 'WhatIf'
                 $row.Message = $dest
                 $results.Add($row)
                 continue
+            }
+
+            $previousState = 'Absent'
+            if (-not $NoServiceRestart -or $InstallService) {
+                $previousState = Invoke-RemoteServiceAction -ComputerName $remote.ComputerName -Name $ServiceName -Action Get -Cred $Credential
+            }
+
+            if (-not $NoServiceRestart -and ($previousState -eq 'Running' -or $previousState -eq 'StartPending' -or $previousState -eq 'StopPending')) {
+                Write-Host "STOP: $($remote.ComputerName) $ServiceName ($previousState)"
+                Invoke-RemoteServiceAction -ComputerName $remote.ComputerName -Name $ServiceName -Action Stop -Cred $Credential | Out-Null
+                $stoppedByScript = $true
+                Start-Sleep -Seconds 2
+            }
+            elseif ($previousState -ne 'Absent') {
+                Write-Verbose "$($remote.ComputerName): $ServiceName = $previousState, установщик пропускаем"
             }
 
             Copy-DirectoryWithRobocopy -SourcePath $Source -DestinationPath $dest
@@ -356,7 +503,7 @@ try {
             $row.Message = $dest
             Write-Host "OK: $($remote.ComputerName) ($copied файлов)"
 
-            if ($InstallService -and $row.Status -eq 'Copied') {
+            if ($InstallService -and $previousState -eq 'Absent') {
                 if ($PSCmdlet.ShouldProcess($remote.ComputerName, "Установить и запустить службу $ServiceName")) {
                     $svcInfo = Install-FilebeatServiceRemote -ComputerName $remote.ComputerName -PackageName $packageName -WindowsServiceName $ServiceName -Cred $Credential -IsLocal $false
                     $row.Status = 'Installed'
@@ -364,11 +511,33 @@ try {
                     Write-Host "SERVICE: $($remote.ComputerName) $ServiceName = $($svcInfo.Status)"
                 }
             }
+            elseif ($stoppedByScript) {
+                $started = Invoke-RemoteServiceAction -ComputerName $remote.ComputerName -Name $ServiceName -Action Start -Cred $Credential
+                $row.Status = 'Restarted'
+                $row.Message = "$($row.Message); служба $started"
+                Write-Host "START: $($remote.ComputerName) $ServiceName = $started"
+            }
+            elseif ($InstallService -and $previousState -ne 'Absent' -and $previousState -ne 'Running') {
+                $started = Invoke-RemoteServiceAction -ComputerName $remote.ComputerName -Name $ServiceName -Action Start -Cred $Credential
+                $row.Status = 'Started'
+                $row.Message = "$($row.Message); служба $started"
+                Write-Host "START: $($remote.ComputerName) $ServiceName = $started"
+            }
         }
         catch {
             $row.Status = 'Failed'
             $row.Message = $_.Exception.Message
             Write-Warning "${display}: $($row.Message)"
+
+            if ($stoppedByScript -and $remote) {
+                try {
+                    Invoke-RemoteServiceAction -ComputerName $remote.ComputerName -Name $ServiceName -Action Start -Cred $Credential | Out-Null
+                    Write-Warning "${display}: служба $ServiceName запущена обратно после ошибки копирования"
+                }
+                catch {
+                    Write-Warning "${display}: не удалось вернуть службу $ServiceName : $($_.Exception.Message)"
+                }
+            }
         }
 
         $results.Add($row)
