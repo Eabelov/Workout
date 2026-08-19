@@ -6,46 +6,61 @@
 
 .DESCRIPTION
     Reads database names from a text file (one per line) and for each database:
-      1. Aborts if any mailbox still lives on the database (user, archive,
-         arbitration, audit, migration, public folder, monitoring).
-      2. Removes every non-Mounted copy and deletes its files via admin UNC.
-      3. Dismounts and removes the last (active) copy, then deletes its files.
+      1. Aborts that database if any mailbox still lives on it (user, archive,
+         arbitration, audit, migration, public folder, monitoring). Re-checks
+         immediately before removing copies and before removing the last copy.
+      2. Verifies EDB/log paths on each passive copy (UNC + optional WinRM),
+         removes the copy, polls until it disappears, then deletes files.
+      3. Requires double confirmation, then dismounts and removes the last
+         (active) copy, polls for completion, and deletes its files.
 
-    Original script bugs that this rewrite fixes:
-      - Curly/smart quotes (“ ”) around -replace broke parsing.
-      - Invoke-Expression + a space (' ') hack to list user mailboxes.
-      - Database names with spaces were not quoted in the IE string.
-      - Get-Content of a single-line file made foreach iterate characters.
-      - Get-MailboxDatabaseCopyStatus has no DatabaseVolumeMountPoint /
-        LogVolumeMountPoint — those properties are empty, so UNC paths were wrong.
-        Real paths come from Get-MailboxDatabase (EdbFilePath / LogFolderPath)
-        and are identical on every DAG copy.
-      - Last-copy UNC path omitted the backslash before "<db>.db" / "<db>.log".
-      - .Replace('C:','C$') is case-sensitive and only handles the C: drive.
-      - while (Test-Path) + Remove-Item with no retry cap loops forever if a
-        file is locked; Remove-Item also errored on the path that was already gone.
-      - Set-MailboxDatabase -CircularLoggingEnabled $false does nothing useful
-        here and on some versions requires a dismount to take effect.
-      - Add-PSSnapin *exch* can load Setup/Support snapins and collide with EMS.
-      - No -ResultSize / -Monitoring / missing-parameter handling on Get-Mailbox.
-      - $lastcopy could be a collection; identities are taken from the DB name.
+    Supports -WhatIf / -Confirm via SupportsShouldProcess. Errors are collected
+    instead of calling exit from the loop; -ContinueOnError keeps going.
+
+.PARAMETER ContinueOnError
+    If set, a failure on one database does not stop the remaining databases.
+    All failures are still reported at the end (exit code 1 if any occurred).
+
+.PARAMETER Force
+    Skip the interactive double confirmation for the last copy. Does not
+    override -WhatIf.
+
+.EXAMPLE
+    .\Remove-ExchangeDatabaseCopies.ps1 -WhatIf
+
+.EXAMPLE
+    .\Remove-ExchangeDatabaseCopies.ps1 -ContinueOnError -PollIntervalSeconds 5
+
+.EXAMPLE
+    .\Remove-ExchangeDatabaseCopies.ps1 -Force
 
 .NOTES
     Run from Exchange Management Shell (or a session with EMS snap-in loaded)
     as an Organization Management admin that can reach C$/D$/... on DAG nodes.
 #>
-[CmdletBinding()]
+[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
 param(
     [string]$DatabaseListPath = 'C:\BEA\dag4databases.txt',
     [string]$HistoryLogPath   = 'C:\BEA\dbcopystatushistory.txt',
-    [int]$CopyRemovalWaitSeconds      = 120,
-    [int]$LastCopyDismountWaitSeconds = 30,
-    [int]$FileDeleteRetryWaitSeconds  = 60,
-    [int]$FileDeleteMaxRetries        = 10
+
+    [int]$PollIntervalSeconds = 5,
+    [Alias('CopyRemovalWaitSeconds')]
+    [int]$CopyRemovalTimeoutSeconds = 120,
+    [Alias('LastCopyDismountWaitSeconds')]
+    [int]$DismountTimeoutSeconds = 60,
+    [int]$DatabaseRemovalTimeoutSeconds = 120,
+    [int]$FileDeleteRetryWaitSeconds = 60,
+    [int]$FileDeleteMaxRetries = 10,
+
+    [switch]$ContinueOnError,
+    [switch]$Force
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+$script:OperationErrors = New-Object 'System.Collections.Generic.List[object]'
+$script:SucceededDatabases = New-Object 'System.Collections.Generic.List[string]'
 
 function Write-Log {
     param(
@@ -59,6 +74,22 @@ function Write-Log {
         New-Item -ItemType Directory -Path $logDir -Force | Out-Null
     }
     Add-Content -LiteralPath $HistoryLogPath -Value $line -Encoding UTF8
+}
+
+function Add-OperationError {
+    param(
+        [Parameter(Mandatory)][string]$Database,
+        [Parameter(Mandatory)][string]$Stage,
+        [Parameter(Mandatory)][string]$Message
+    )
+    $item = [pscustomobject]@{
+        Timestamp = Get-Date
+        Database  = $Database
+        Stage     = $Stage
+        Message   = $Message
+    }
+    [void]$script:OperationErrors.Add($item)
+    Write-Log "${Database} [${Stage}]: $Message" 'ERROR'
 }
 
 function Initialize-ExchangeShell {
@@ -125,8 +156,10 @@ function Get-DatabaseFileFolders {
         throw "Database $DatabaseName is missing EdbFilePath or LogFolderPath."
     }
     [pscustomobject]@{
-        EdbFolder = Split-Path -Parent $edbFile
-        LogFolder = $logDir
+        EdbFile     = $edbFile
+        EdbFolder   = Split-Path -Parent $edbFile
+        EdbFileName = Split-Path -Leaf $edbFile
+        LogFolder   = $logDir
     }
 }
 
@@ -168,12 +201,171 @@ function Test-DatabaseHasMailboxes {
     return $found
 }
 
+function Assert-DatabaseHasNoMailboxes {
+    param(
+        [Parameter(Mandatory)][string]$DatabaseName,
+        [Parameter(Mandatory)][string]$Stage
+    )
+    $occupiedBy = @(Test-DatabaseHasMailboxes -DatabaseName $DatabaseName)
+    if ($occupiedBy.Count -gt 0) {
+        throw "Database $DatabaseName is not empty ($Stage); found: $($occupiedBy -join ', ')."
+    }
+    Write-Log "Mailbox check passed ($Stage) for $DatabaseName"
+}
+
+function Wait-ForCondition {
+    param(
+        [Parameter(Mandatory)][scriptblock]$Condition,
+        [Parameter(Mandatory)][string]$Description,
+        [Parameter(Mandatory)][int]$TimeoutSeconds,
+        [int]$PollSeconds = 5,
+        [object[]]$ArgumentList = @()
+    )
+    if ($PollSeconds -lt 1) {
+        $PollSeconds = 1
+    }
+    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($true) {
+        $ready = [bool](& $Condition @ArgumentList)
+        if ($ready) {
+            Write-Log "Ready: $Description ($([int]$stopwatch.Elapsed.TotalSeconds)s)"
+            return
+        }
+        if ($stopwatch.Elapsed.TotalSeconds -ge $TimeoutSeconds) {
+            throw "Timed out after $TimeoutSeconds s waiting for: $Description"
+        }
+        Write-Log "Polling ($([int]$stopwatch.Elapsed.TotalSeconds)s/$TimeoutSeconds s): $Description"
+        Start-Sleep -Seconds $PollSeconds
+    }
+}
+
+function Test-IsNotFoundError {
+    param($ErrorRecord)
+    $message = $ErrorRecord.Exception.Message
+    $fqid = [string]$ErrorRecord.FullyQualifiedErrorId
+    return ($message -match 'couldn.?t find|cannot find|not found|doesn.?t exist|wasn.?t found') -or
+        $fqid -match 'ManagementObjectNotFound'
+}
+
+function Test-CopyStatusAbsent {
+    param(
+        [Parameter(Mandatory)][string]$DatabaseName,
+        [Parameter(Mandatory)][string]$CopyName
+    )
+    try {
+        $status = @(Get-MailboxDatabaseCopyStatus -Identity $DatabaseName -ErrorAction Stop)
+        return -not ($status | Where-Object { $_.Name -eq $CopyName })
+    } catch {
+        if (Test-IsNotFoundError $_) {
+            return $true
+        }
+        throw
+    }
+}
+
+function Test-DatabaseDismounted {
+    param([Parameter(Mandatory)][string]$CopyName)
+    try {
+        $status = @(Get-MailboxDatabaseCopyStatus -Identity $CopyName -ErrorAction Stop)
+        if ($status.Count -eq 0) {
+            return $true
+        }
+        return $status[0].Status.ToString() -eq 'Dismounted'
+    } catch {
+        if (Test-IsNotFoundError $_) {
+            return $true
+        }
+        throw
+    }
+}
+
+function Test-MailboxDatabaseAbsent {
+    param([Parameter(Mandatory)][string]$DatabaseName)
+    try {
+        $db = @(Get-MailboxDatabase -Identity $DatabaseName -ErrorAction Stop)
+        return $db.Count -eq 0
+    } catch {
+        if (Test-IsNotFoundError $_) {
+            return $true
+        }
+        throw
+    }
+}
+
+function Assert-CopyFilesOnServer {
+    param(
+        [Parameter(Mandatory)][string]$MailboxServer,
+        [Parameter(Mandatory)][string]$DatabaseName,
+        [Parameter(Mandatory)][string]$EdbFolder,
+        [Parameter(Mandatory)][string]$EdbFileName,
+        [Parameter(Mandatory)][string]$LogFolder
+    )
+
+    $edbUnc     = ConvertTo-AdminShareUnc -ComputerName $MailboxServer -LocalPath $EdbFolder
+    $logUnc     = ConvertTo-AdminShareUnc -ComputerName $MailboxServer -LocalPath $LogFolder
+    $edbFileUnc = Join-Path $edbUnc $EdbFileName
+
+    $missing = New-Object 'System.Collections.Generic.List[string]'
+    if (-not (Test-Path -LiteralPath $edbUnc)) {
+        [void]$missing.Add("UNC EDB folder $edbUnc")
+    }
+    if (-not (Test-Path -LiteralPath $edbFileUnc)) {
+        [void]$missing.Add("UNC EDB file $edbFileUnc")
+    }
+    if (-not (Test-Path -LiteralPath $logUnc)) {
+        [void]$missing.Add("UNC log folder $logUnc")
+    }
+
+    $remoteNote = 'skipped'
+    try {
+        $remote = Invoke-Command -ComputerName $MailboxServer -ErrorAction Stop -ScriptBlock {
+            param($EdbFolder, $EdbFileName, $LogFolder)
+            $edbFile = Join-Path $EdbFolder $EdbFileName
+            [pscustomobject]@{
+                EdbFolderExists = Test-Path -LiteralPath $EdbFolder
+                EdbFileExists   = Test-Path -LiteralPath $edbFile
+                LogFolderExists = Test-Path -LiteralPath $LogFolder
+            }
+        } -ArgumentList $EdbFolder, $EdbFileName, $LogFolder
+
+        if (-not $remote.EdbFolderExists) {
+            [void]$missing.Add("local EDB folder $EdbFolder on $MailboxServer")
+        }
+        if (-not $remote.EdbFileExists) {
+            [void]$missing.Add("local EDB file $(Join-Path $EdbFolder $EdbFileName) on $MailboxServer")
+        }
+        if (-not $remote.LogFolderExists) {
+            [void]$missing.Add("local log folder $LogFolder on $MailboxServer")
+        }
+        $remoteNote = 'ok'
+    } catch {
+        Write-Log "Remote path check on $MailboxServer failed ($($_.Exception.Message)); using UNC results." 'WARN'
+        $remoteNote = 'failed'
+    }
+
+    if ($missing.Count -gt 0) {
+        throw "Path verification failed for $DatabaseName on ${MailboxServer}: $($missing -join '; ')"
+    }
+
+    Write-Log "Verified paths on ${MailboxServer} (remote=$remoteNote): edb=$edbFileUnc log=$logUnc"
+    [pscustomobject]@{
+        EdbUnc     = $edbUnc
+        LogUnc     = $logUnc
+        EdbFileUnc = $edbFileUnc
+    }
+}
+
 function Remove-FolderWithRetry {
     param(
         [Parameter(Mandatory)][string]$Path,
         [Parameter(Mandatory)][int]$MaxRetries,
         [Parameter(Mandatory)][int]$WaitSeconds
     )
+
+    if ($WhatIfPreference) {
+        Write-Log "WhatIf: would delete $Path"
+        return
+    }
 
     for ($attempt = 1; $attempt -le $MaxRetries; $attempt++) {
         if (-not (Test-Path -LiteralPath $Path)) {
@@ -199,14 +391,92 @@ function Remove-DatabaseFilesOnServer {
     param(
         [Parameter(Mandatory)][string]$MailboxServer,
         [Parameter(Mandatory)][string]$EdbFolder,
-        [Parameter(Mandatory)][string]$LogFolder
+        [Parameter(Mandatory)][string]$EdbFileName,
+        [Parameter(Mandatory)][string]$LogFolder,
+        [Parameter(Mandatory)][string]$DatabaseName
     )
 
-    $dbUnc  = ConvertTo-AdminShareUnc -ComputerName $MailboxServer -LocalPath $EdbFolder
+    $edbUnc = ConvertTo-AdminShareUnc -ComputerName $MailboxServer -LocalPath $EdbFolder
     $logUnc = ConvertTo-AdminShareUnc -ComputerName $MailboxServer -LocalPath $LogFolder
-    Write-Log "File paths on ${MailboxServer}: db=$dbUnc log=$logUnc"
-    Remove-FolderWithRetry -Path $dbUnc  -MaxRetries $FileDeleteMaxRetries -WaitSeconds $FileDeleteRetryWaitSeconds
-    Remove-FolderWithRetry -Path $logUnc -MaxRetries $FileDeleteMaxRetries -WaitSeconds $FileDeleteRetryWaitSeconds
+    $edbGone = -not (Test-Path -LiteralPath $edbUnc)
+    $logGone = -not (Test-Path -LiteralPath $logUnc)
+    if ($edbGone -and $logGone) {
+        Write-Log "Files already absent on ${MailboxServer}: $edbUnc / $logUnc"
+        return
+    }
+
+    $verified = Assert-CopyFilesOnServer -MailboxServer $MailboxServer -DatabaseName $DatabaseName `
+        -EdbFolder $EdbFolder -EdbFileName $EdbFileName -LogFolder $LogFolder
+    Remove-FolderWithRetry -Path $verified.EdbUnc -MaxRetries $FileDeleteMaxRetries -WaitSeconds $FileDeleteRetryWaitSeconds
+    Remove-FolderWithRetry -Path $verified.LogUnc -MaxRetries $FileDeleteMaxRetries -WaitSeconds $FileDeleteRetryWaitSeconds
+}
+
+function Test-IsInteractiveHost {
+    try {
+        return [Environment]::UserInteractive -and
+            $Host.Name -ne 'ServerRemoteHost' -and
+            -not [Console]::IsInputRedirected
+    } catch {
+        return [Environment]::UserInteractive
+    }
+}
+
+function Confirm-LastCopyRemoval {
+    param(
+        [Parameter(Mandatory)][string]$DatabaseName,
+        [Parameter(Mandatory)][string]$CopyName,
+        [Parameter(Mandatory)][string]$MailboxServer
+    )
+
+    if ($WhatIfPreference) {
+        Write-Log "WhatIf: would require double confirmation to remove last copy $CopyName on $MailboxServer"
+        return $true
+    }
+    if ($Force) {
+        Write-Log "Force: skipping double confirmation for last copy $CopyName"
+        return $true
+    }
+    if (-not (Test-IsInteractiveHost)) {
+        throw "Last copy of '$DatabaseName' requires interactive double confirmation or -Force (non-interactive host)."
+    }
+
+    Write-Host ''
+    Write-Host "WARNING: You are about to DISMOUNT and DELETE the LAST copy of '$DatabaseName'." -ForegroundColor Red
+    Write-Host "Copy:   $CopyName"
+    Write-Host "Server: $MailboxServer"
+    Write-Host 'This removes the database from Active Directory and deletes its files.'
+    Write-Host ''
+
+    $first = Read-Host "Confirm 1/2: re-type the database name '$DatabaseName'"
+    if ($first -cne $DatabaseName) {
+        throw "First confirmation failed for '$DatabaseName' (typed '$first')."
+    }
+
+    $second = Read-Host "Confirm 2/2: type DELETE to permanently remove the last copy"
+    if ($second -ne 'DELETE') {
+        throw "Second confirmation failed for '$DatabaseName' (typed '$second', expected DELETE)."
+    }
+
+    Write-Log "Double confirmation accepted for last copy $CopyName"
+    return $true
+}
+
+function Invoke-ConfirmedOperation {
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param(
+        [Parameter(Mandatory)][string]$Target,
+        [Parameter(Mandatory)][string]$Action,
+        [Parameter(Mandatory)][scriptblock]$Operation
+    )
+    if ($PSCmdlet.ShouldProcess($Target, $Action)) {
+        & $Operation
+        return $true
+    }
+    if ($WhatIfPreference) {
+        Write-Log "WhatIf: $Action — $Target"
+        return $false
+    }
+    throw "Operation cancelled: $Action — $Target"
 }
 
 # -----------------------------------------------------------------------------
@@ -231,19 +501,21 @@ if ($databases.Count -eq 0) {
     throw "No database names in $DatabaseListPath"
 }
 Write-Log "Loaded $($databases.Count) database(s) from $DatabaseListPath"
+if ($ContinueOnError) {
+    Write-Log 'ContinueOnError is enabled: a failure on one database will not stop the rest.'
+}
+if ($WhatIfPreference) {
+    Write-Log 'WhatIf is enabled: no copies or files will be removed.'
+}
 
 foreach ($dbToRemove in $databases) {
     try {
         Write-Log "==== Processing database $dbToRemove ===="
 
-        $occupiedBy = @(Test-DatabaseHasMailboxes -DatabaseName $dbToRemove)
-        if ($occupiedBy.Count -gt 0) {
-            Write-Log "Database $dbToRemove is not empty (found: $($occupiedBy -join ', ')). Stopping." 'ERROR'
-            exit 1
-        }
+        Assert-DatabaseHasNoMailboxes -DatabaseName $dbToRemove -Stage 'initial'
 
         $folders = Get-DatabaseFileFolders -DatabaseName $dbToRemove
-        Write-Log "EdbFolder=$($folders.EdbFolder) LogFolder=$($folders.LogFolder)"
+        Write-Log "EdbFolder=$($folders.EdbFolder) EdbFile=$($folders.EdbFileName) LogFolder=$($folders.LogFolder)"
 
         $allCopies = @(Get-MailboxDatabaseCopyStatus -Identity $dbToRemove)
         $allCopies | Format-List * | Out-File -FilePath $HistoryLogPath -Encoding utf8 -Append
@@ -251,40 +523,104 @@ foreach ($dbToRemove in $databases) {
         $passiveCopies = @($allCopies | Where-Object { $_.Status.ToString() -ne 'Mounted' })
         Write-Log "Passive copies to remove: $(@($passiveCopies | ForEach-Object { $_.Name }) -join ', ')"
 
+        Assert-DatabaseHasNoMailboxes -DatabaseName $dbToRemove -Stage 'before copy removal'
+
         foreach ($copy in $passiveCopies) {
-            Write-Log "DELETING copy $($copy.Name) on $($copy.MailboxServer)"
-            Remove-MailboxDatabaseCopy -Identity $copy.Name -Confirm:$false
-            Start-Sleep -Seconds $CopyRemovalWaitSeconds
-            Remove-DatabaseFilesOnServer -MailboxServer $copy.MailboxServer `
-                -EdbFolder $folders.EdbFolder -LogFolder $folders.LogFolder
+            Write-Log "Preparing passive copy $($copy.Name) on $($copy.MailboxServer)"
+            $null = Assert-CopyFilesOnServer -MailboxServer $copy.MailboxServer -DatabaseName $dbToRemove `
+                -EdbFolder $folders.EdbFolder -EdbFileName $folders.EdbFileName -LogFolder $folders.LogFolder
+
+            $copyAction = "Remove passive mailbox database copy and delete files on $($copy.MailboxServer)"
+            $didCopy = Invoke-ConfirmedOperation -Target $copy.Name -Action $copyAction -Operation {
+                Remove-MailboxDatabaseCopy -Identity $copy.Name -Confirm:$false
+                Wait-ForCondition -Description "copy $($copy.Name) removed from copy status" `
+                    -TimeoutSeconds $CopyRemovalTimeoutSeconds -PollSeconds $PollIntervalSeconds `
+                    -Condition {
+                        param($DatabaseName, $CopyName)
+                        Test-CopyStatusAbsent -DatabaseName $DatabaseName -CopyName $CopyName
+                    } -ArgumentList $dbToRemove, $copy.Name
+                Remove-DatabaseFilesOnServer -MailboxServer $copy.MailboxServer -DatabaseName $dbToRemove `
+                    -EdbFolder $folders.EdbFolder -EdbFileName $folders.EdbFileName -LogFolder $folders.LogFolder
+            }
+            if (-not $didCopy -and $WhatIfPreference) {
+                Write-Log "WhatIf: would poll until $($copy.Name) is gone, then delete verified files on $($copy.MailboxServer)"
+            }
         }
 
-        $remaining = @(Get-MailboxDatabaseCopyStatus -Identity $dbToRemove)
+        $remaining = @(Get-MailboxDatabaseCopyStatus -Identity $dbToRemove -ErrorAction SilentlyContinue)
         $leftoverPassive = @($remaining | Where-Object { $_.Status.ToString() -ne 'Mounted' })
-        if ($leftoverPassive.Count -gt 0) {
-            $leftoverNames = @($leftoverPassive | ForEach-Object { $_.Name }) -join ', '
-            Write-Log "Not all database copies were successfully deleted: $leftoverNames" 'ERROR'
-            exit 1
-        }
-        if ($remaining.Count -ne 1) {
-            Write-Log "Expected exactly one mounted copy of $dbToRemove, found $($remaining.Count)." 'ERROR'
-            exit 1
+        $mountedCopies = @($remaining | Where-Object { $_.Status.ToString() -eq 'Mounted' })
+
+        if ($WhatIfPreference) {
+            if ($mountedCopies.Count -ne 1) {
+                Write-Log "WhatIf: expected one Mounted copy of $dbToRemove after removing passives; found $($mountedCopies.Count)." 'WARN'
+            }
+        } else {
+            if ($leftoverPassive.Count -gt 0) {
+                $leftoverNames = @($leftoverPassive | ForEach-Object { $_.Name }) -join ', '
+                throw "Not all database copies were successfully deleted: $leftoverNames"
+            }
+            if ($remaining.Count -ne 1) {
+                throw "Expected exactly one mounted copy of $dbToRemove, found $($remaining.Count)."
+            }
         }
 
-        $lastCopy = $remaining[0]
-        Write-Log "DELETING LASTCOPY $($lastCopy.Name) (status=$($lastCopy.Status))"
-        Dismount-Database -Identity $lastCopy.DatabaseName -Confirm:$false
-        Start-Sleep -Seconds $LastCopyDismountWaitSeconds
-        Remove-MailboxDatabase -Identity $lastCopy.DatabaseName -Confirm:$false
-        Start-Sleep -Seconds $CopyRemovalWaitSeconds
-        Remove-DatabaseFilesOnServer -MailboxServer $lastCopy.MailboxServer `
-            -EdbFolder $folders.EdbFolder -LogFolder $folders.LogFolder
+        if ($mountedCopies.Count -eq 0) {
+            throw "No mounted copy of $dbToRemove is available for last-copy removal."
+        }
 
+        $lastCopy = $mountedCopies[0]
+        Assert-DatabaseHasNoMailboxes -DatabaseName $dbToRemove -Stage 'before last copy removal'
+        $null = Assert-CopyFilesOnServer -MailboxServer $lastCopy.MailboxServer -DatabaseName $dbToRemove `
+            -EdbFolder $folders.EdbFolder -EdbFileName $folders.EdbFileName -LogFolder $folders.LogFolder
+
+        Write-Log "Preparing LASTCOPY $($lastCopy.Name) (status=$($lastCopy.Status))"
+        $null = Confirm-LastCopyRemoval -DatabaseName $dbToRemove -CopyName $lastCopy.Name `
+            -MailboxServer $lastCopy.MailboxServer
+
+        $lastAction = "Dismount and remove LAST mailbox database copy, then delete files on $($lastCopy.MailboxServer)"
+        $didLast = Invoke-ConfirmedOperation -Target $lastCopy.Name -Action $lastAction -Operation {
+            Dismount-Database -Identity $lastCopy.DatabaseName -Confirm:$false
+            Wait-ForCondition -Description "database $($lastCopy.DatabaseName) dismounted" `
+                -TimeoutSeconds $DismountTimeoutSeconds -PollSeconds $PollIntervalSeconds `
+                -Condition {
+                    param($CopyName)
+                    Test-DatabaseDismounted -CopyName $CopyName
+                } -ArgumentList $lastCopy.Name
+            Remove-MailboxDatabase -Identity $lastCopy.DatabaseName -Confirm:$false
+            Wait-ForCondition -Description "database $($lastCopy.DatabaseName) removed from AD" `
+                -TimeoutSeconds $DatabaseRemovalTimeoutSeconds -PollSeconds $PollIntervalSeconds `
+                -Condition {
+                    param($DatabaseName)
+                    Test-MailboxDatabaseAbsent -DatabaseName $DatabaseName
+                } -ArgumentList $lastCopy.DatabaseName
+            Remove-DatabaseFilesOnServer -MailboxServer $lastCopy.MailboxServer -DatabaseName $dbToRemove `
+                -EdbFolder $folders.EdbFolder -EdbFileName $folders.EdbFileName -LogFolder $folders.LogFolder
+        }
+        if (-not $didLast -and $WhatIfPreference) {
+            Write-Log "WhatIf: would dismount/remove $($lastCopy.Name) and delete verified files on $($lastCopy.MailboxServer)"
+        }
+
+        [void]$script:SucceededDatabases.Add($dbToRemove)
         Write-Log "==== Finished database $dbToRemove ===="
     } catch {
-        Write-Log "Failed while processing '$dbToRemove': $($_.Exception.Message)" 'ERROR'
-        throw
+        Add-OperationError -Database $dbToRemove -Stage 'Processing' -Message $_.Exception.Message
+        if (-not $ContinueOnError) {
+            Write-Log 'ContinueOnError is off; remaining databases will not be processed.' 'WARN'
+            break
+        }
     }
+}
+
+Write-Log "Succeeded: $($script:SucceededDatabases.Count); errors: $($script:OperationErrors.Count)"
+if ($script:SucceededDatabases.Count -gt 0) {
+    Write-Log ("OK: " + ($script:SucceededDatabases -join ', '))
+}
+if ($script:OperationErrors.Count -gt 0) {
+    foreach ($err in $script:OperationErrors) {
+        Write-Log ("FAIL {0} [{1}] {2}" -f $err.Database, $err.Stage, $err.Message) 'ERROR'
+    }
+    exit 1
 }
 
 Write-Log 'All listed databases processed.'
