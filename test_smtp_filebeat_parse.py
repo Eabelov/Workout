@@ -129,6 +129,8 @@ def test_config_contains_required_bits() -> None:
     assert re.search(r"id: smtp-frontend-send", text)
     assert re.search(r"id: smtp-hub-receive", text)
     assert "arr.slice(7, arr.length - 1).join(\",\")" in text
+    assert text.count("prospector.scanner.fingerprint.enabled: false") == 4
+    assert text.count("file_identity.native: ~") == 4
 
 
 if __name__ == "__main__":

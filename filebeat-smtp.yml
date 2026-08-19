@@ -3,6 +3,10 @@
 # Fields: date-time,connector-id,session-id,sequence-number,local-endpoint,remote-endpoint,event,data,context
 # Header lines start with # and are skipped.
 # File names: SENDyyyyMMddhh-nnnn.log / RECVyyyyMMddhh-nnnn.log
+#
+# Filebeat 9+ filestream fingerprint waits until a file is 1024 bytes.
+# New SMTP logs often contain only a ~300-byte header, so fingerprint is
+# disabled and native file identity is used instead.
 
 filebeat.inputs:
   - type: filestream
@@ -11,6 +15,8 @@ filebeat.inputs:
       - C:\Queue\TransportLogs\FrontEnd\ProtocolLog\SmtpSend\*.log
     encoding: utf-8
     exclude_lines: ['^#']
+    prospector.scanner.fingerprint.enabled: false
+    file_identity.native: ~
     fields:
       transport_role: frontend
       smtp_direction: send
@@ -23,6 +29,8 @@ filebeat.inputs:
       - C:\Queue\TransportLogs\FrontEnd\ProtocolLog\SmtpReceive\*.log
     encoding: utf-8
     exclude_lines: ['^#']
+    prospector.scanner.fingerprint.enabled: false
+    file_identity.native: ~
     fields:
       transport_role: frontend
       smtp_direction: receive
@@ -35,6 +43,8 @@ filebeat.inputs:
       - C:\Queue\TransportLogs\Hub\ProtocolLog\SmtpSend\*.log
     encoding: utf-8
     exclude_lines: ['^#']
+    prospector.scanner.fingerprint.enabled: false
+    file_identity.native: ~
     fields:
       transport_role: hub
       smtp_direction: send
@@ -47,6 +57,8 @@ filebeat.inputs:
       - C:\Queue\TransportLogs\Hub\ProtocolLog\SmtpReceive\*.log
     encoding: utf-8
     exclude_lines: ['^#']
+    prospector.scanner.fingerprint.enabled: false
+    file_identity.native: ~
     fields:
       transport_role: hub
       smtp_direction: receive
