@@ -4,9 +4,9 @@
 from __future__ import annotations
 
 import base64
-import html
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 
@@ -250,35 +250,43 @@ def main() -> None:
         print("Chrome was not found; skipped PNG and PDF rendering.")
         return
 
-    common = [
-        chrome,
-        "--headless=new",
-        "--no-sandbox",
-        "--disable-gpu",
-        "--hide-scrollbars",
-        "--disable-software-rasterizer",
-        "--run-all-compositor-stages-before-draw",
-        "--virtual-time-budget=2000",
-    ]
-    subprocess.run(
-        common
-        + [
-            f"--window-size={WIDTH},{HEIGHT}",
-            "--force-device-scale-factor=1",
-            f"--screenshot={png_path}",
-            svg_path.as_uri(),
-        ],
-        check=True,
-    )
-    subprocess.run(
-        common
-        + [
-            "--no-pdf-header-footer",
-            f"--print-to-pdf={pdf_path}",
-            html_path.as_uri(),
-        ],
-        check=True,
-    )
+    with tempfile.TemporaryDirectory(prefix="flyer-chrome-") as profile:
+        common = [
+            chrome,
+            "--headless=new",
+            "--no-sandbox",
+            "--disable-gpu",
+            "--hide-scrollbars",
+            "--disable-background-networking",
+            "--disable-component-update",
+            "--disable-default-apps",
+            "--disable-software-rasterizer",
+            "--no-first-run",
+            "--run-all-compositor-stages-before-draw",
+            "--virtual-time-budget=2000",
+            f"--user-data-dir={profile}",
+        ]
+        subprocess.run(
+            common
+            + [
+                f"--window-size={WIDTH},{HEIGHT}",
+                "--force-device-scale-factor=1",
+                f"--screenshot={png_path}",
+                svg_path.as_uri(),
+            ],
+            check=True,
+            timeout=45,
+        )
+        subprocess.run(
+            common
+            + [
+                "--no-pdf-header-footer",
+                f"--print-to-pdf={pdf_path}",
+                html_path.as_uri(),
+            ],
+            check=True,
+            timeout=45,
+        )
 
     print(f"Created {svg_path}")
     print(f"Created {png_path}")
