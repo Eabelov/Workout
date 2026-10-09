@@ -219,12 +219,11 @@ def build_svg() -> str:
 def main() -> None:
     svg = build_svg()
     svg_path = ROOT / "flyer.svg"
-    html_path = ROOT / "flyer.html"
     png_path = ROOT / "flyer.png"
     pdf_path = ROOT / "flyer.pdf"
 
     svg_path.write_text(svg, encoding="utf-8")
-    html_path.write_text(
+    html_document = (
         """<!doctype html>
 <html lang="ru">
 <head>
@@ -240,8 +239,7 @@ def main() -> None:
 <body>
 """
         + svg
-        + "\n</body>\n</html>\n",
-        encoding="utf-8",
+        + "\n</body>\n</html>\n"
     )
 
     system_chrome = Path("/usr/bin/google-chrome-stable")
@@ -256,6 +254,8 @@ def main() -> None:
         return
 
     with tempfile.TemporaryDirectory(prefix="flyer-chrome-") as profile:
+        html_path = Path(profile) / "flyer.html"
+        html_path.write_text(html_document, encoding="utf-8")
         common = [
             chrome,
             "--headless=new",
