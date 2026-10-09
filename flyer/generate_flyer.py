@@ -244,7 +244,12 @@ def main() -> None:
         encoding="utf-8",
     )
 
-    chrome = shutil.which("google-chrome") or shutil.which("chromium")
+    system_chrome = Path("/usr/bin/google-chrome-stable")
+    chrome = (
+        str(system_chrome)
+        if system_chrome.exists()
+        else shutil.which("chromium") or shutil.which("google-chrome")
+    )
     if not chrome:
         print(f"Created {svg_path}")
         print("Chrome was not found; skipped PNG and PDF rendering.")
